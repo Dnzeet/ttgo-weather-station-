@@ -9,10 +9,11 @@ Firmware stasiun cuaca dan jam untuk LilyGo T-Display (ESP32, ST7789 135x240). D
 4. Matahari, UV, AQI, tekanan
 5. Jam analog
 
-Ikon baterai di header (tanpa persen), berubah menjadi animasi dengan petir saat sedang diisi.
+Ikon baterai di header (tanpa persen; di halaman jam digeser ke kanan karena tidak ada jam di header), berubah menjadi animasi dengan petir saat sedang diisi.
 
 ## Tombol
-- BTN1 (GPIO0): halaman berikut. Tahan 3 detik: hapus WiFi, masuk mode setup
+- BTN1 (GPIO0, tombol atas): halaman berikut. Klik ganda: power off (deep sleep). Tahan 3 detik: hapus WiFi, masuk mode setup
+- Bangun dari power off: tekan BTN2 (GPIO35, tombol bawah)
 - BTN2 (GPIO35): refresh data. Tahan 1 detik: buka menu pengaturan
 - Di menu: BTN1 pilih item, BTN2 ubah nilai, tahan BTN2 simpan dan keluar
 - Layar yang mati/redup: tombol pertama hanya membangunkan layar
