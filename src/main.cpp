@@ -1,8 +1,12 @@
 // ============================================================
-//  Weather Station - LilyGo T-Display (ESP32, ST7789 135x240)
-//  Data: Open-Meteo (tanpa API key). UI: 4 halaman + web setup.
-//  Tombol: BTN1 (GPIO0) = halaman berikut, tahan 3 dtk = reset WiFi
-//          BTN2 (GPIO35) = refresh data, tahan 1 dtk = ganti kecerahan
+//  Weather Station + Jam - LilyGo T-Display (ESP32, ST7789 135x240)
+//  Data: Open-Meteo (tanpa API key). 5 halaman + menu + web setup.
+//
+//  Tombol (mode normal):
+//   BTN1 (GPIO0)  : halaman berikut | tahan 3 dtk = reset WiFi
+//   BTN2 (GPIO35) : refresh data    | tahan 1 dtk = menu pengaturan
+//  Di menu:
+//   BTN1 = pilih item, BTN2 = ubah nilai, tahan BTN2 = simpan & keluar
 // ============================================================
 #include <Arduino.h>
 #include <WiFi.h>
@@ -19,10 +23,11 @@
 
 #define BTN1 0
 #define BTN2 35
+#define BAT_PIN 34
 #define ROT 1                    // ganti ke 3 untuk layar terbalik
 #define AP_NAME "Weather-Setup"
 #define AUTO_ROTATE_MS 10000UL   // 0 = matikan auto ganti halaman
-#define PAGES 4
+#define PAGES 5
 #define SW 240
 #define SH 135
 
@@ -37,10 +42,20 @@ struct Config {
   String ssid, pass, city;
   float lat, lon;
   uint16_t ivl;
-  uint8_t bri;
   int32_t tz;
   bool needGeo;
+  uint8_t briIdx;   // 0..4 -> 100,75,50,25,10 %
+  uint8_t saver;    // 0 mati, 1 ringan, 2 sedang, 3 maksimal
+  uint8_t sch;      // jadwal layar mati (indeks SCH)
+  bool autoDim;     // redup otomatis saat malam
+  bool showBat;     // tampilkan ikon baterai
 } cfg;
+
+const uint8_t BRI[5] = {255, 190, 128, 64, 25};
+const char* SAV_TXT[4] = {"Mati", "Ringan", "Sedang", "Maksimal"};
+struct Sch { int8_t from, to; };
+const Sch SCH[4] = {{-1, -1}, {0, 5}, {23, 5}, {22, 6}};
+const char* SCH_TXT[4] = {"Mati", "00:00-05:00", "23:00-05:00", "22:00-06:00"};
 
 struct Weather {
   bool valid;
@@ -59,8 +74,20 @@ struct Weather {
 int page = 0;
 uint32_t frame = 0;
 bool apMode = false, fetching = false, fetchNow = true;
+bool inMenu = false;
+int menuSel = 0;
 String lastErr;
 uint32_t restartAt = 0, lastInput = 0, lastRot = 0, lastFetch = 0, lastReconn = 0, lastGeo = 0, lastFrame = 0;
+
+// backlight
+uint8_t curBri = 255, tgtBri = 255;
+bool screenOff = false, dimmed = false;
+uint32_t lastBriCalc = 0, lastFade = 0;
+
+// baterai
+float vbat = 0, vTrend = 0;
+bool batPresent = false, charging = false;
+uint32_t lastBat = 0, lastTrend = 0;
 
 uint16_t C_BG, C_PANEL, C_TXT, C_MUT, C_ACC, C_BLUE, C_TEAL, C_AREA, C_TRACK, C_CLOUD, C_CLOUD2;
 
@@ -75,10 +102,17 @@ void loadCfg() {
   cfg.lat = prefs.getFloat("lat", -6.2088f);
   cfg.lon = prefs.getFloat("lon", 106.8456f);
   cfg.ivl = prefs.getUShort("ivl", 10);
-  cfg.bri = prefs.getUChar("bri", 255);
   cfg.tz = prefs.getInt("tz", 7 * 3600);
   cfg.needGeo = prefs.getBool("geo", false);
+  cfg.briIdx = prefs.getUChar("bi", 0);
+  cfg.saver = prefs.getUChar("sav", 0);
+  cfg.sch = prefs.getUChar("sch", 0);
+  cfg.autoDim = prefs.getBool("adim", true);
+  cfg.showBat = prefs.getBool("bat", true);
   prefs.end();
+  if (cfg.briIdx > 4) cfg.briIdx = 0;
+  if (cfg.saver > 3) cfg.saver = 0;
+  if (cfg.sch > 3) cfg.sch = 0;
 }
 
 void saveCfg() {
@@ -89,9 +123,13 @@ void saveCfg() {
   prefs.putFloat("lat", cfg.lat);
   prefs.putFloat("lon", cfg.lon);
   prefs.putUShort("ivl", cfg.ivl);
-  prefs.putUChar("bri", cfg.bri);
   prefs.putInt("tz", cfg.tz);
   prefs.putBool("geo", cfg.needGeo);
+  prefs.putUChar("bi", cfg.briIdx);
+  prefs.putUChar("sav", cfg.saver);
+  prefs.putUChar("sch", cfg.sch);
+  prefs.putBool("adim", cfg.autoDim);
+  prefs.putBool("bat", cfg.showBat);
   prefs.end();
 }
 
@@ -118,7 +156,7 @@ void setTheme(bool day) {
   C_CLOUD2 = tft.color565(140, 155, 178);
 }
 
-// ---------------- util cuaca ----------------
+// ---------------- util cuaca & waktu ----------------
 enum Ico { I_SUN, I_MOON, I_PART, I_PARTN, I_CLOUD, I_RAIN, I_STORM, I_SNOW, I_FOG };
 
 int codeToIco(int c, bool day) {
@@ -162,6 +200,8 @@ int dowOf(int y, int m, int d) {  // 0 = Minggu
   return (y + y / 4 - y / 100 + y / 400 + t[m - 1] + d) % 7;
 }
 const char* DOW[] = {"Min", "Sen", "Sel", "Rab", "Kam", "Jum", "Sab"};
+const char* DAYFULL[] = {"Minggu", "Senin", "Selasa", "Rabu", "Kamis", "Jumat", "Sabtu"};
+const char* MON[] = {"Jan", "Feb", "Mar", "Apr", "Mei", "Jun", "Jul", "Agu", "Sep", "Okt", "Nov", "Des"};
 
 int hhmm(const char* s) {
   if (!s || strlen(s) < 16) return 0;
@@ -169,6 +209,60 @@ int hhmm(const char* s) {
 }
 
 bool nowTm(struct tm& t) { return getLocalTime(&t, 0) && t.tm_year >= 124; }
+
+uint32_t fetchIntervalMs() {
+  uint32_t m = cfg.ivl;
+  if (cfg.saver >= 2 && m < 30) m = 30;
+  return m * 60000UL;
+}
+
+// ---------------- baterai ----------------
+void sampleBattery() {
+  uint32_t sum = 0;
+  for (int i = 0; i < 16; i++) sum += analogReadMilliVolts(BAT_PIN);
+  float v = (sum / 16.0f) * 2.0f / 1000.0f;  // pembagi tegangan 2:1
+  if (vbat < 0.1f) vbat = v;
+  else vbat = vbat * 0.7f + v * 0.3f;
+  batPresent = (vbat > 2.8f && vbat < 4.6f);
+  if (vbat > 4.19f) charging = true;
+  if (millis() - lastTrend > 60000UL) {  // tren tegangan tiap 1 menit
+    lastTrend = millis();
+    if (vTrend > 0.1f) {
+      float d = vbat - vTrend;
+      if (d > 0.012f) charging = true;
+      else if (d < -0.012f) charging = false;
+    }
+    vTrend = vbat;
+  }
+}
+
+int batBars() {
+  if (vbat > 4.05f) return 4;
+  if (vbat > 3.88f) return 3;
+  if (vbat > 3.72f) return 2;
+  if (vbat > 3.58f) return 1;
+  return 0;
+}
+
+void drawBattery(int x, int y) {
+  if (!cfg.showBat || !batPresent) return;
+  int bars = batBars();
+  bool low = (bars <= 1 && !charging);
+  uint16_t col = C_TXT;
+  if (low && ((frame / 10) % 2)) col = spr.color565(240, 70, 70);
+  spr.drawRoundRect(x, y, 15, 9, 2, col);
+  spr.fillRect(x + 15, y + 3, 2, 3, col);
+  int show = bars;
+  if (charging && bars < 4) show = bars + (int)((frame / 8) % (uint32_t)(5 - bars));
+  for (int i = 0; i < 4; i++) {
+    uint16_t c = (i < show) ? (charging ? C_TEAL : col) : C_TRACK;
+    spr.fillRect(x + 2 + i * 3, y + 2, 2, 5, c);
+  }
+  if (charging) {  // petir
+    spr.fillTriangle(x + 8, y + 1, x + 5, y + 5, x + 8, y + 5, C_ACC);
+    spr.fillTriangle(x + 7, y + 4, x + 10, y + 4, x + 7, y + 8, C_ACC);
+  }
+}
 
 // ---------------- gambar ikon ----------------
 void drawCloud(int x, int y, int s, uint16_t c) {
@@ -256,37 +350,42 @@ int drawDegNum(int x, int y, int v, int font, uint16_t col) {
   spr.setTextColor(col);
   spr.setTextDatum(TL_DATUM);
   int w = spr.drawString(b, x, y, font);
-  spr.drawCircle(x + w + 3, y + 3, 2, col);
+  int ry = (font >= 4) ? 5 : 3;
+  spr.drawCircle(x + w + 3, y + ry, 2, col);
   return x + w + 7;
 }
 
 // ---------------- komponen UI ----------------
-void drawHeader(const char* title) {
+void drawHeader(const char* title, bool showClock = true) {
   spr.setTextDatum(TL_DATUM);
   spr.setTextColor(C_MUT);
   spr.drawString(title, 6, 2, 2);
   for (int i = 0; i < PAGES; i++) {
-    int dx = 104 + i * 11;
+    int dx = 100 + i * 10;
     if (i == page) spr.fillCircle(dx, 9, 3, C_ACC);
     else spr.fillCircle(dx, 9, 2, C_TRACK);
   }
-  struct tm ti;
-  char b[8];
-  if (nowTm(ti)) snprintf(b, sizeof(b), "%02d:%02d", ti.tm_hour, ti.tm_min);
-  else strcpy(b, "--:--");
-  spr.setTextDatum(TR_DATUM);
-  spr.setTextColor(C_TXT);
-  spr.drawString(b, 236, 2, 2);
+  drawBattery(150, 4);
+  if (showClock) {
+    struct tm ti;
+    char b[8];
+    if (nowTm(ti)) snprintf(b, sizeof(b), "%02d:%02d", ti.tm_hour, ti.tm_min);
+    else strcpy(b, "--:--");
+    spr.setTextDatum(TR_DATUM);
+    spr.setTextColor(C_TXT);
+    spr.drawString(b, 236, 2, 2);
+  }
   int bars = 0;
   if (WiFi.status() == WL_CONNECTED) {
     int r = WiFi.RSSI();
     bars = r > -55 ? 4 : r > -65 ? 3 : r > -75 ? 2 : 1;
   }
+  int wx0 = showClock ? 176 : 222;
   for (int i = 0; i < 4; i++) {
     int h = 3 + i * 2;
-    spr.fillRect(176 + i * 4, 14 - h, 3, h, i < bars ? C_TEAL : C_TRACK);
+    spr.fillRect(wx0 + i * 4, 14 - h, 3, h, i < bars ? C_TEAL : C_TRACK);
   }
-  if (fetching) spr.fillCircle(168, 9, 2, C_ACC);
+  if (fetching) spr.fillCircle(wx0 - 6, 9, 2, C_ACC);
 }
 
 void drawSpinner(int cx, int cy) {
@@ -342,35 +441,57 @@ void drawStars() {
 }
 
 // ---------------- halaman ----------------
-void pageNow() {
+// 0: jam besar + cuaca ringkas
+void pageHome() {
   char city[16];
-  strncpy(city, cfg.city.c_str(), 11);
-  city[11] = 0;
-  drawHeader(city);
-  if (!wx.valid) { drawLoading(); return; }
-  if (!wx.isDay) drawStars();
-  drawIcon(codeToIco(wx.code, wx.isDay), 56, 50, 22, true);
-  spr.setTextColor(C_TXT);
+  strncpy(city, cfg.city.c_str(), 10);
+  city[10] = 0;
+  drawHeader(city, false);
+  if (wx.valid && !wx.isDay) drawStars();
+
+  struct tm ti;
+  bool ok = nowTm(ti);
+  char b[24];
+  if (ok) snprintf(b, sizeof(b), "%02d:%02d", ti.tm_hour, ti.tm_min);
+  else strcpy(b, "--:--");
   spr.setTextDatum(TL_DATUM);
-  char b[12];
-  snprintf(b, sizeof(b), "%d", iround(wx.temp));
-  int w = spr.drawString(b, 112, 22, 6);
-  spr.drawCircle(112 + w + 6, 30, 3, C_TXT);
-  spr.drawCircle(112 + w + 6, 30, 2, C_TXT);
-  spr.drawString("C", 112 + w + 13, 24, 4);
-  spr.setTextColor(C_ACC);
-  spr.drawString(codeText(wx.code), 112, 72, 2);
-  spr.setTextColor(C_MUT);
-  spr.drawString("Terasa", 112, 88, 2);
-  drawDegNum(166, 88, iround(wx.feels), 2, C_MUT);
-  snprintf(b, sizeof(b), "%d%%", wx.hum);
-  chip(6, 108, 72, 0, b, C_BLUE);
-  snprintf(b, sizeof(b), "%dkm/j", iround(wx.wind));
-  chip(84, 108, 72, 1, b, C_TEAL);
-  snprintf(b, sizeof(b), "%d%%", wx.pop);
-  chip(162, 108, 72, 2, b, C_ACC);
+  spr.setTextColor(C_TXT);
+  int w = spr.drawString(b, 6, 20, 6);
+  if (ok) {
+    snprintf(b, sizeof(b), "%02d", ti.tm_sec);
+    spr.setTextColor(C_ACC);
+    spr.drawString(b, 6 + w + 4, 46, 4);
+    snprintf(b, sizeof(b), "%s, %d %s", DAYFULL[ti.tm_wday % 7], ti.tm_mday, MON[ti.tm_mon % 12]);
+    spr.setTextColor(C_MUT);
+    spr.drawString(b, 8, 74, 2);
+  }
+
+  if (wx.valid) {
+    drawIcon(codeToIco(wx.code, wx.isDay), 200, 36, 13, true);
+    drawDegNum(178, 54, iround(wx.temp), 4, C_TXT);
+    spr.setTextDatum(TR_DATUM);
+    spr.setTextColor(C_ACC);
+    spr.drawString(codeText(wx.code), 236, 88, 2);
+    snprintf(b, sizeof(b), "%d%%", wx.hum);
+    chip(6, 108, 72, 0, b, C_BLUE);
+    snprintf(b, sizeof(b), "%dkm/j", iround(wx.wind));
+    chip(84, 108, 72, 1, b, C_TEAL);
+    snprintf(b, sizeof(b), "%d%%", wx.pop);
+    chip(162, 108, 72, 2, b, C_ACC);
+  } else {
+    drawSpinner(200, 50);
+    spr.setTextDatum(TR_DATUM);
+    if (lastErr.length()) {
+      spr.setTextColor(C_ACC);
+      spr.drawString(lastErr, 236, 88, 2);
+    } else {
+      spr.setTextColor(C_MUT);
+      spr.drawString("Memuat...", 236, 88, 2);
+    }
+  }
 }
 
+// 1: grafik per jam
 void pageHourly() {
   drawHeader("Per jam");
   if (!wx.valid || wx.nh < 2) { drawLoading(); return; }
@@ -422,6 +543,7 @@ void pageHourly() {
   }
 }
 
+// 2: 5 hari
 void pageDays() {
   drawHeader("5 hari");
   if (!wx.valid || wx.nd < 1) { drawLoading(); return; }
@@ -458,6 +580,7 @@ void pageDays() {
   }
 }
 
+// 3: matahari, UV, AQI
 void pageSun() {
   drawHeader("Matahari");
   if (!wx.valid) { drawLoading(); return; }
@@ -496,7 +619,6 @@ void pageSun() {
     spr.drawString(b, cx, 76, 2);
   }
 
-  // UV
   const int RX = 160;
   spr.setTextDatum(TL_DATUM);
   spr.setTextColor(C_MUT);
@@ -514,7 +636,6 @@ void pageSun() {
   spr.setTextColor(uvc[ui]);
   spr.drawString(uvt[ui], RX, 70, 1);
 
-  // AQI
   spr.setTextColor(C_MUT);
   spr.drawString("AQI", RX, 84, 1);
   if (wx.aqi >= 0) {
@@ -536,15 +657,115 @@ void pageSun() {
   spr.drawString(b, 236, 120, 1);
 }
 
+// 4: jam analog
+void pageAnalog() {
+  drawHeader("Jam", false);
+  struct tm ti;
+  bool ok = nowTm(ti);
+  const int cx = 64, cy = 76, R = 50;
+  spr.drawCircle(cx, cy, R, C_TRACK);
+  spr.drawCircle(cx, cy, R - 1, C_TRACK);
+  for (int i = 0; i < 60; i++) {
+    float a = i * 0.10471976f;
+    float s = sinf(a), c = cosf(a);
+    if (i % 5 == 0) {
+      bool q = (i % 15 == 0);
+      int r1 = R - (q ? 10 : 7), r2 = R - 3;
+      uint16_t col = q ? C_ACC : C_TXT;
+      spr.drawLine(cx + (int)(s * r1), cy - (int)(c * r1), cx + (int)(s * r2), cy - (int)(c * r2), col);
+      if (q) spr.drawLine(cx + (int)(s * r1) + 1, cy - (int)(c * r1), cx + (int)(s * r2) + 1, cy - (int)(c * r2), col);
+    } else {
+      spr.drawPixel(cx + (int)(s * (R - 4)), cy - (int)(c * (R - 4)), C_MUT);
+    }
+  }
+  char b[24];
+  if (ok) {
+    float hDeg = ((ti.tm_hour % 12) + ti.tm_min / 60.0f) * 30.0f;
+    float mDeg = (ti.tm_min + ti.tm_sec / 60.0f) * 6.0f;
+    float sDeg = ti.tm_sec * 6.0f;
+    float ha = hDeg * 0.017453293f, ma = mDeg * 0.017453293f, sa = sDeg * 0.017453293f;
+    int hx = cx + (int)(sinf(ha) * 28), hy = cy - (int)(cosf(ha) * 28);
+    int mx = cx + (int)(sinf(ma) * 40), my = cy - (int)(cosf(ma) * 40);
+    int sx = cx + (int)(sinf(sa) * 46), sy = cy - (int)(cosf(sa) * 46);
+    int tx = cx - (int)(sinf(sa) * 9), ty = cy + (int)(cosf(sa) * 9);
+    spr.drawLine(cx, cy, hx, hy, C_TXT);
+    spr.drawLine(cx + 1, cy, hx + 1, hy, C_TXT);
+    spr.drawLine(cx, cy + 1, hx, hy + 1, C_TXT);
+    spr.drawLine(cx, cy, mx, my, C_TXT);
+    spr.drawLine(cx + 1, cy, mx + 1, my, C_TXT);
+    spr.drawLine(tx, ty, sx, sy, C_ACC);
+    snprintf(b, sizeof(b), "%02d:%02d", ti.tm_hour, ti.tm_min);
+  } else {
+    strcpy(b, "--:--");
+  }
+  spr.fillCircle(cx, cy, 3, C_ACC);
+
+  spr.setTextDatum(TC_DATUM);
+  spr.setTextColor(C_TXT);
+  spr.drawString(b, 181, 30, 4);
+  if (ok) {
+    snprintf(b, sizeof(b), "%s, %d %s", DAYFULL[ti.tm_wday % 7], ti.tm_mday, MON[ti.tm_mon % 12]);
+    spr.setTextColor(C_MUT);
+    spr.drawString(b, 181, 64, 2);
+  }
+  if (wx.valid) {
+    drawIcon(codeToIco(wx.code, wx.isDay), 148, 106, 9, true);
+    drawDegNum(168, 94, iround(wx.temp), 4, C_TXT);
+  }
+}
+
+// ---------------- menu pengaturan ----------------
+void pageMenu() {
+  spr.setTextDatum(TL_DATUM);
+  spr.setTextColor(C_MUT);
+  spr.drawString("PENGATURAN", 6, 2, 2);
+  const char* L[5] = {"Kecerahan", "Mode hemat", "Redup malam", "Layar mati", "Ikon baterai"};
+  for (int i = 0; i < 5; i++) {
+    int y = 22 + i * 19;
+    if (i == menuSel) {
+      spr.fillRoundRect(4, y, 232, 18, 4, C_PANEL);
+      spr.fillRect(4, y, 3, 18, C_ACC);
+    }
+    spr.setTextDatum(TL_DATUM);
+    spr.setTextColor(C_TXT);
+    spr.drawString(L[i], 14, y + 1, 2);
+    if (i == 0) {
+      for (int k = 0; k < 5; k++) spr.fillRoundRect(170 + k * 13, y + 5, 11, 8, 2, k < 5 - cfg.briIdx ? C_ACC : C_TRACK);
+    } else {
+      const char* v = "";
+      uint16_t col = C_TXT;
+      switch (i) {
+        case 1: v = SAV_TXT[cfg.saver]; col = cfg.saver ? C_TEAL : C_MUT; break;
+        case 2: v = cfg.autoDim ? "Aktif" : "Mati"; col = cfg.autoDim ? C_TEAL : C_MUT; break;
+        case 3: v = SCH_TXT[cfg.sch]; col = cfg.sch ? C_TXT : C_MUT; break;
+        default: v = cfg.showBat ? "Tampil" : "Sembunyi"; col = cfg.showBat ? C_TEAL : C_MUT; break;
+      }
+      spr.setTextDatum(TR_DATUM);
+      spr.setTextColor(col);
+      spr.drawString(v, 230, y + 1, 2);
+    }
+  }
+  spr.setTextDatum(TC_DATUM);
+  spr.setTextColor(C_MUT);
+  spr.drawString("1:pilih  2:ubah  tahan 2:keluar", 120, 122, 1);
+}
+
 void renderPage(int p) {
   setTheme(wx.valid ? (wx.isDay != 0) : true);
   spr.fillSprite(C_BG);
   switch (p) {
-    case 0: pageNow(); break;
+    case 0: pageHome(); break;
     case 1: pageHourly(); break;
     case 2: pageDays(); break;
-    default: pageSun(); break;
+    case 3: pageSun(); break;
+    default: pageAnalog(); break;
   }
+}
+
+void renderMenu() {
+  setTheme(wx.valid ? (wx.isDay != 0) : true);
+  spr.fillSprite(C_BG);
+  pageMenu();
 }
 
 void goPage(int p) {
@@ -754,6 +975,11 @@ void handleRoot() {
   h.replace("%LAT%", String(cfg.lat, 4));
   h.replace("%LON%", String(cfg.lon, 4));
   h.replace("%IVL%", String(cfg.ivl));
+  h.replace("%BRI%", String(cfg.briIdx));
+  h.replace("%SAV%", String(cfg.saver));
+  h.replace("%ADIM%", cfg.autoDim ? "1" : "0");
+  h.replace("%SCH%", String(cfg.sch));
+  h.replace("%BAT%", cfg.showBat ? "1" : "0");
   server.send(200, "text/html; charset=utf-8", h);
 }
 
@@ -791,6 +1017,11 @@ void handleSave() {
   if (city.length()) cfg.city = city;
   int iv = server.arg("ivl").toInt();
   if (iv >= 5 && iv <= 120) cfg.ivl = iv;
+  if (server.hasArg("bri")) cfg.briIdx = constrain(server.arg("bri").toInt(), 0, 4);
+  if (server.hasArg("sav")) cfg.saver = constrain(server.arg("sav").toInt(), 0, 3);
+  if (server.hasArg("adim")) cfg.autoDim = server.arg("adim").toInt() != 0;
+  if (server.hasArg("sch")) cfg.sch = constrain(server.arg("sch").toInt(), 0, 3);
+  if (server.hasArg("bat")) cfg.showBat = server.arg("bat").toInt() != 0;
   saveCfg();
   server.send(200, "text/html; charset=utf-8", SAVED_HTML);
   restartAt = millis() + 1500;
@@ -805,7 +1036,7 @@ void handleNotFound() {
   }
 }
 
-// ---------------- WiFi ----------------
+// ---------------- WiFi & daya ----------------
 void startAP() {
   WiFi.mode(WIFI_AP_STA);
   WiFi.softAP(AP_NAME);
@@ -835,6 +1066,12 @@ bool connectSTA() {
   return WiFi.status() == WL_CONNECTED;
 }
 
+void applyPower() {
+  if (apMode) return;
+  setCpuFrequencyMhz(cfg.saver >= 1 ? 80 : 240);
+  WiFi.setSleep(cfg.saver >= 1);
+}
+
 void resetWifi() {
   cfg.ssid = "";
   cfg.pass = "";
@@ -844,7 +1081,53 @@ void resetWifi() {
   ESP.restart();
 }
 
-// ---------------- tombol ----------------
+// ---------------- backlight ----------------
+bool inSchedule(int hour) {
+  int f = SCH[cfg.sch].from, t = SCH[cfg.sch].to;
+  if (f < 0) return false;
+  if (f < t) return hour >= f && hour < t;
+  return hour >= f || hour < t;
+}
+
+uint8_t calcTarget() {
+  int t = BRI[cfg.briIdx];
+  if (cfg.autoDim && wx.valid && !wx.isDay) t = max(8, t / 4);
+  uint32_t idle = millis() - lastInput;
+  dimmed = false;
+  screenOff = false;
+  if (inMenu) return (uint8_t)t;
+  if (cfg.saver >= 1 && idle > 60000UL) {
+    if (t > 35) t = 35;
+    dimmed = true;
+  }
+  if (cfg.saver == 3 && idle > 300000UL) {
+    t = 0;
+    screenOff = true;
+  }
+  struct tm ti;
+  if (cfg.sch && idle > 30000UL && nowTm(ti) && inSchedule(ti.tm_hour)) {
+    t = 0;
+    screenOff = true;
+  }
+  return (uint8_t)t;
+}
+
+void updateBacklight() {
+  if (millis() - lastBriCalc > 200) {
+    lastBriCalc = millis();
+    tgtBri = calcTarget();
+  }
+  if (curBri != tgtBri && millis() - lastFade >= 12) {
+    lastFade = millis();
+    int d = (int)tgtBri - (int)curBri;
+    if (d > 16) d = 16;
+    if (d < -16) d = -16;
+    curBri = (uint8_t)((int)curBri + d);
+    ledcWrite(0, curBri);
+  }
+}
+
+// ---------------- tombol & menu ----------------
 struct Btn { uint8_t pin; bool down; uint32_t t0; bool longDone; };
 Btn b1 = {BTN1, false, 0, false};
 Btn b2 = {BTN2, false, 0, false};
@@ -861,15 +1144,23 @@ int pollBtn(Btn& b, uint32_t longMs) {
   return 0;
 }
 
-const uint8_t BRI[] = {255, 150, 70, 25};
-void cycleBrightness() {
-  uint8_t nb = BRI[0];
-  for (int i = 0; i < 4; i++) if (BRI[i] < cfg.bri) { nb = BRI[i]; break; }
-  cfg.bri = nb;
-  ledcWrite(0, nb);
-  prefs.begin("wx", false);
-  prefs.putUChar("bri", nb);
-  prefs.end();
+void exitMenu() {
+  inMenu = false;
+  saveCfg();
+}
+
+void menuInput(int e1, int e2) {
+  if (e1 == 1) menuSel = (menuSel + 1) % 5;
+  if (e2 == 1) {
+    switch (menuSel) {
+      case 0: cfg.briIdx = (cfg.briIdx + 1) % 5; break;
+      case 1: cfg.saver = (cfg.saver + 1) % 4; applyPower(); break;
+      case 2: cfg.autoDim = !cfg.autoDim; break;
+      case 3: cfg.sch = (cfg.sch + 1) % 4; break;
+      default: cfg.showBat = !cfg.showBat; break;
+    }
+  }
+  if (e2 == 2) exitMenu();
 }
 
 // ---------------- setup & loop ----------------
@@ -877,6 +1168,7 @@ void setup() {
   Serial.begin(115200);
   pinMode(BTN1, INPUT_PULLUP);
   pinMode(BTN2, INPUT);  // GPIO35: pull-up eksternal di board
+  analogSetPinAttenuation(BAT_PIN, ADC_11db);
 
   tft.init();
   tft.setRotation(ROT);
@@ -889,10 +1181,12 @@ void setup() {
   memset(&wx, 0, sizeof(wx));
   wx.aqi = -1;
   loadCfg();
+  curBri = tgtBri = BRI[cfg.briIdx];
   ledcSetup(0, 5000, 8);
   ledcAttachPin(TFT_BL, 0);
-  ledcWrite(0, cfg.bri);
+  ledcWrite(0, curBri);
   setTheme(true);
+  sampleBattery();
 
   msgScreen("Weather", "T-Display Station", "memulai...");
   delay(600);
@@ -921,6 +1215,7 @@ void setup() {
     delay(1800);
     fetchNow = true;
   }
+  applyPower();
   lastInput = millis();
   lastRot = millis();
 }
@@ -932,14 +1227,12 @@ void loop() {
 
   int e1 = pollBtn(b1, 3000);
   int e2 = pollBtn(b2, 900);
-  if (e1 == 2) resetWifi();
-  if (e1 == 1 && !apMode) {
+  if (e1 || e2) {
+    if (screenOff) { e1 = 0; e2 = 0; }  // tombol pertama hanya membangunkan layar
     lastInput = millis();
     lastRot = millis();
-    goPage((page + 1) % PAGES);
   }
-  if (e2 == 1) { lastInput = millis(); fetchNow = true; }
-  if (e2 == 2) cycleBrightness();
+  if (e1 == 2 && !inMenu) resetWifi();
 
   if (apMode) {
     // di mode setup: kalau WiFi tersimpan ternyata nyambung, restart ke mode normal
@@ -948,36 +1241,61 @@ void loop() {
     return;
   }
 
+  if (inMenu) {
+    menuInput(e1, e2);
+    if (millis() - lastInput > 30000UL) exitMenu();
+  } else {
+    if (e1 == 1) goPage((page + 1) % PAGES);
+    if (e2 == 1) fetchNow = true;
+    if (e2 == 2) { inMenu = true; menuSel = 0; }
+  }
+
+  if (millis() - lastBat > 5000UL) {
+    lastBat = millis();
+    sampleBattery();
+  }
+  updateBacklight();
+
   if (WiFi.status() == WL_CONNECTED) {
     if (cfg.needGeo && millis() - lastGeo > 15000UL) {
       lastGeo = millis();
       if (geocode()) { fetchNow = true; wx.valid = false; }
     }
-    if (!cfg.needGeo && (fetchNow || millis() - lastFetch > (uint32_t)cfg.ivl * 60000UL)) {
+    if (!cfg.needGeo && (fetchNow || millis() - lastFetch > fetchIntervalMs())) {
       fetchNow = false;
       fetching = true;
-      renderPage(page);
-      spr.pushSprite(0, 0);
+      if (!screenOff) {
+        if (inMenu) renderMenu();
+        else renderPage(page);
+        spr.pushSprite(0, 0);
+      }
       bool ok = fetchWeather();
       if (ok) fetchAqi();
       fetching = false;
       lastFetch = millis();
-      if (!ok) lastFetch = millis() - (uint32_t)cfg.ivl * 60000UL + 30000UL;  // coba lagi 30 dtk
+      if (!ok) lastFetch = millis() - fetchIntervalMs() + 30000UL;  // coba lagi 30 dtk
     }
   } else if (millis() - lastReconn > 15000UL) {
     lastReconn = millis();
     WiFi.reconnect();
   }
 
-  if (AUTO_ROTATE_MS && wx.valid && millis() - lastInput > 30000UL && millis() - lastRot > AUTO_ROTATE_MS) {
+  if (AUTO_ROTATE_MS && cfg.saver < 2 && !inMenu && wx.valid && !screenOff &&
+      millis() - lastInput > 30000UL && millis() - lastRot > AUTO_ROTATE_MS) {
     lastRot = millis();
     goPage((page + 1) % PAGES);
   }
 
-  if (millis() - lastFrame >= 50) {
+  uint32_t fi = 50;
+  if (cfg.saver == 1 && dimmed) fi = 100;
+  else if (cfg.saver >= 2) fi = dimmed ? 250 : 100;
+  if (millis() - lastFrame >= fi) {
     lastFrame = millis();
     frame++;
-    renderPage(page);
-    spr.pushSprite(0, 0);
+    if (!(screenOff && curBri == 0)) {
+      if (inMenu) renderMenu();
+      else renderPage(page);
+      spr.pushSprite(0, 0);
+    }
   }
 }

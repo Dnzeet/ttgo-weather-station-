@@ -33,11 +33,22 @@ button{padding:11px 16px;border:0;border-radius:10px;background:#27486f;color:#e
 <p class="m" id="msg" style="margin-top:8px"></p>
 <label>Update data tiap</label>
 <select name="ivl" id="iv"><option value="5">5 menit</option><option value="10">10 menit</option><option value="15">15 menit</option><option value="30">30 menit</option><option value="60">60 menit</option></select>
+<label>Kecerahan layar</label>
+<select name="bri" id="br"><option value="0">100%</option><option value="1">75%</option><option value="2">50%</option><option value="3">25%</option><option value="4">10%</option></select>
+<label>Mode hemat baterai</label>
+<select name="sav" id="sv"><option value="0">Mati</option><option value="1">Ringan: redup setelah 1 menit</option><option value="2">Sedang: + animasi lambat, update 30 menit</option><option value="3">Maksimal: + layar mati setelah 5 menit</option></select>
+<label>Redup otomatis saat malam</label>
+<select name="adim" id="ad"><option value="1">Aktif</option><option value="0">Mati</option></select>
+<label>Layar mati terjadwal</label>
+<select name="sch" id="sc"><option value="0">Tidak</option><option value="1">00:00 - 05:00</option><option value="2">23:00 - 05:00</option><option value="3">22:00 - 06:00</option></select>
+<label>Ikon baterai</label>
+<select name="bat" id="bt"><option value="1">Tampil</option><option value="0">Sembunyi</option></select>
 <button class="p">Simpan dan restart</button>
 </form></div>
 <script>
 var $=function(i){return document.getElementById(i)};
 $('iv').value='%IVL%';
+$('br').value='%BRI%';$('sv').value='%SAV%';$('ad').value='%ADIM%';$('sc').value='%SCH%';$('bt').value='%BAT%';
 fetch('/scan').then(function(r){return r.json()}).then(function(a){
 var s=$('ss');s.innerHTML='<option value="">Pilih jaringan...</option>';
 a.forEach(function(n){var o=document.createElement('option');o.value=o.textContent=n;s.appendChild(o)});
