@@ -19,6 +19,8 @@
 #include <ArduinoJson.h>
 #include <TFT_eSPI.h>
 #include <time.h>
+#include <driver/gpio.h>
+#include <esp_sleep.h>
 #include "web_ui.h"
 
 #define BTN1 0
@@ -308,12 +310,12 @@ void drawIcon(int ic, int x, int y, int s, bool anim) {
     case I_SUN: drawSun(x, y, (int)(s * 0.6f), rot); break;
     case I_MOON: drawMoon(x, y, (int)(s * 0.65f)); break;
     case I_PART:
-      drawSun(x - (int)(s * 0.45f), y - (int)(s * 0.4f), (int)(s * 0.5f), rot);
-      drawCloud(x + (int)(s * 0.1f) + wob, y + (int)(s * 0.15f), (int)(s * 0.8f), C_CLOUD);
+      drawSun(x - (int)(s * 0.5f), y - (int)(s * 0.5f), (int)(s * 0.45f), rot);
+      drawCloud(x + (int)(s * 0.2f) + wob, y + (int)(s * 0.25f), (int)(s * 0.7f), C_CLOUD);
       break;
     case I_PARTN:
-      drawMoon(x - (int)(s * 0.45f), y - (int)(s * 0.4f), (int)(s * 0.5f));
-      drawCloud(x + (int)(s * 0.1f) + wob, y + (int)(s * 0.15f), (int)(s * 0.8f), C_CLOUD);
+      drawMoon(x - (int)(s * 0.5f), y - (int)(s * 0.5f), (int)(s * 0.55f));
+      drawCloud(x + (int)(s * 0.2f) + wob, y + (int)(s * 0.25f), (int)(s * 0.7f), C_CLOUD);
       break;
     case I_CLOUD: drawCloud(x + wob, y - (int)(s * 0.1f), s, C_CLOUD); break;
     case I_RAIN:
@@ -365,7 +367,7 @@ void drawHeader(const char* title, bool showClock = true) {
     if (i == page) spr.fillCircle(dx, 9, 3, C_ACC);
     else spr.fillCircle(dx, 9, 2, C_TRACK);
   }
-  drawBattery(150, 4);
+  drawBattery(showClock ? 150 : 198, 4);
   if (showClock) {
     struct tm ti;
     char b[8];
@@ -385,7 +387,7 @@ void drawHeader(const char* title, bool showClock = true) {
     int h = 3 + i * 2;
     spr.fillRect(wx0 + i * 4, 14 - h, 3, h, i < bars ? C_TEAL : C_TRACK);
   }
-  if (fetching) spr.fillCircle(wx0 - 6, 9, 2, C_ACC);
+  if (fetching) spr.fillCircle(showClock ? 170 : 192, 9, 2, C_ACC);
 }
 
 void drawSpinner(int cx, int cy) {
@@ -410,44 +412,33 @@ void drawLoading() {
 
 void chip(int x, int y, int w, int kind, const char* txt, uint16_t col) {
   spr.fillRoundRect(x, y, w, 24, 5, C_PANEL);
+  int cx = x + 11, cy = y + 12;  // pusat ikon
   if (kind == 0) {  // tetes
-    spr.fillCircle(x + 11, y + 15, 4, col);
-    spr.fillTriangle(x + 11, y + 5, x + 7, y + 13, x + 15, y + 13, col);
+    spr.fillCircle(cx, cy + 2, 4, col);
+    spr.fillTriangle(cx, cy - 6, cx - 4, cy + 1, cx + 4, cy + 1, col);
   } else if (kind == 1) {  // angin
-    spr.drawFastHLine(x + 5, y + 8, 12, col);
-    spr.drawFastHLine(x + 7, y + 12, 10, col);
-    spr.drawFastHLine(x + 5, y + 16, 8, col);
+    spr.fillRoundRect(cx - 6, cy - 5, 11, 2, 1, col);
+    spr.fillRoundRect(cx - 6, cy - 1, 14, 2, 1, col);
+    spr.fillRoundRect(cx - 6, cy + 3, 8, 2, 1, col);
   } else {  // payung
-    spr.fillCircle(x + 11, y + 12, 7, col);
-    spr.fillRect(x + 3, y + 12, 17, 8, C_PANEL);
-    spr.drawFastVLine(x + 11, y + 12, 8, col);
+    spr.fillCircle(cx, cy + 1, 7, col);
+    spr.fillRect(cx - 8, cy + 1, 17, 8, C_PANEL);
+    spr.drawFastVLine(cx, cy + 1, 7, col);
+    spr.drawPixel(cx - 1, cy + 8, col);
+    spr.drawPixel(cx - 2, cy + 7, col);
   }
   spr.setTextColor(C_TXT);
   spr.setTextDatum(ML_DATUM);
   spr.drawString(txt, x + 24, y + 12, 2);
 }
 
-const uint8_t STARS[][2] = {{10, 26}, {24, 40}, {40, 24}, {58, 30}, {12, 60}, {30, 84},
-                            {84, 26}, {96, 48}, {70, 92}, {98, 80}, {50, 98}, {18, 96}};
-void drawStars() {
-  for (int i = 0; i < 12; i++) {
-    int v = (int)(150 + 100 * sinf(frame * 0.08f + i * 1.7f));
-    if (v < 0) v = 0;
-    if (v > 255) v = 255;
-    uint16_t c = spr.color565(v, v, v);
-    spr.drawPixel(STARS[i][0], STARS[i][1], c);
-    if (i % 3 == 0) spr.drawPixel(STARS[i][0] + 1, STARS[i][1], c);
-  }
-}
-
 // ---------------- halaman ----------------
 // 0: jam besar + cuaca ringkas
 void pageHome() {
   char city[16];
-  strncpy(city, cfg.city.c_str(), 10);
-  city[10] = 0;
+  strncpy(city, cfg.city.c_str(), 13);
+  city[13] = 0;
   drawHeader(city, false);
-  if (wx.valid && !wx.isDay) drawStars();
 
   struct tm ti;
   bool ok = nowTm(ti);
@@ -467,7 +458,7 @@ void pageHome() {
   }
 
   if (wx.valid) {
-    drawIcon(codeToIco(wx.code, wx.isDay), 200, 36, 13, true);
+    drawIcon(codeToIco(wx.code, wx.isDay), 202, 34, 16, true);
     drawDegNum(178, 54, iround(wx.temp), 4, C_TXT);
     spr.setTextDatum(TR_DATUM);
     spr.setTextColor(C_ACC);
@@ -1128,20 +1119,47 @@ void updateBacklight() {
 }
 
 // ---------------- tombol & menu ----------------
-struct Btn { uint8_t pin; bool down; uint32_t t0; bool longDone; };
-Btn b1 = {BTN1, false, 0, false};
-Btn b2 = {BTN2, false, 0, false};
+struct Btn { uint8_t pin; bool down; uint32_t t0; bool longDone; uint8_t clicks; uint32_t tRel; };
+Btn b1 = {BTN1, false, 0, false, 0, 0};
+Btn b2 = {BTN2, false, 0, false, 0, 0};
 
-int pollBtn(Btn& b, uint32_t longMs) {
+// return: 0 tidak ada, 1 klik, 2 tahan, 3 klik ganda (hanya jika dbl = true)
+int pollBtn(Btn& b, uint32_t longMs, bool dbl) {
   bool p = (digitalRead(b.pin) == LOW);
   uint32_t now = millis();
   if (p && !b.down) { b.down = true; b.t0 = now; b.longDone = false; return 0; }
-  if (p && b.down && !b.longDone && now - b.t0 >= longMs) { b.longDone = true; return 2; }
+  if (p && b.down && !b.longDone && now - b.t0 >= longMs) { b.longDone = true; b.clicks = 0; return 2; }
   if (!p && b.down) {
     b.down = false;
-    if (!b.longDone && now - b.t0 > 40) return 1;
+    if (b.longDone || now - b.t0 <= 40) return 0;
+    if (!dbl) return 1;
+    b.clicks++;
+    b.tRel = now;
+    if (b.clicks >= 2) { b.clicks = 0; return 3; }
+    return 0;
   }
+  if (dbl && !p && b.clicks == 1 && now - b.tRel >= 300) { b.clicks = 0; return 1; }
   return 0;
+}
+
+// power off: deep sleep, bangun dengan BTN2 (GPIO35)
+void goSleep() {
+  msgScreen("Mati", "Tekan BTN2", "untuk menyala");
+  delay(1500);
+  while (digitalRead(BTN2) == LOW) delay(10);
+  ledcWrite(0, 0);
+  ledcDetachPin(TFT_BL);
+  pinMode(TFT_BL, OUTPUT);
+  digitalWrite(TFT_BL, LOW);
+  tft.writecommand(TFT_DISPOFF);
+  tft.writecommand(TFT_SLPIN);
+  server.stop();
+  WiFi.disconnect(true);
+  WiFi.mode(WIFI_OFF);
+  gpio_hold_en((gpio_num_t)TFT_BL);
+  gpio_deep_sleep_hold_en();
+  esp_sleep_enable_ext0_wakeup(GPIO_NUM_35, 0);
+  esp_deep_sleep_start();
 }
 
 void exitMenu() {
@@ -1166,6 +1184,8 @@ void menuInput(int e1, int e2) {
 // ---------------- setup & loop ----------------
 void setup() {
   Serial.begin(115200);
+  gpio_hold_dis((gpio_num_t)TFT_BL);
+  gpio_deep_sleep_hold_dis();
   pinMode(BTN1, INPUT_PULLUP);
   pinMode(BTN2, INPUT);  // GPIO35: pull-up eksternal di board
   analogSetPinAttenuation(BAT_PIN, ADC_11db);
@@ -1225,14 +1245,15 @@ void loop() {
   if (apMode) dns.processNextRequest();
   if (restartAt && millis() > restartAt) ESP.restart();
 
-  int e1 = pollBtn(b1, 3000);
-  int e2 = pollBtn(b2, 900);
+  int e1 = pollBtn(b1, 3000, true);
+  int e2 = pollBtn(b2, 900, false);
   if (e1 || e2) {
     if (screenOff) { e1 = 0; e2 = 0; }  // tombol pertama hanya membangunkan layar
     lastInput = millis();
     lastRot = millis();
   }
   if (e1 == 2 && !inMenu) resetWifi();
+  if (e1 == 3 && !inMenu) goSleep();
 
   if (apMode) {
     // di mode setup: kalau WiFi tersimpan ternyata nyambung, restart ke mode normal
