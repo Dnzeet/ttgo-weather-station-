@@ -2,11 +2,12 @@
 //  Weather Station + Jam - LilyGo T-Display (ESP32, ST7789 135x240)
 //  Data: Open-Meteo (tanpa API key). 5 halaman + menu + web setup.
 //
-//  Tombol (mode normal):
-//   BTN1 (GPIO0)  : halaman berikut | tahan 3 dtk = reset WiFi
-//   BTN2 (GPIO35) : refresh data    | tahan 1 dtk = menu pengaturan
-//  Di menu:
-//   BTN1 = pilih item, BTN2 = ubah nilai, tahan BTN2 = simpan & keluar
+//  Tombol bawah (BTN1, GPIO0)  : klik = halaman berikut | tahan 3 dtk = reset WiFi
+//  Tombol atas  (BTN2, GPIO35) : klik = refresh data | klik ganda = POWER OFF
+//                                tahan 1 dtk = menu pengaturan
+//  Bangun dari power off: tekan sekali tombol atas.
+//  Di menu: bawah = pilih item, atas = ubah nilai, tahan atas = simpan & keluar
+//  Pola power off & baca baterai mengikuti firmware Emochi.
 // ============================================================
 #include <Arduino.h>
 #include <WiFi.h>
@@ -26,6 +27,7 @@
 #define BTN1 0
 #define BTN2 35
 #define BAT_PIN 34
+#define ADC_EN 14                // BAT_EN: enable pengukuran baterai (HIGH hanya saat mengukur)
 #define ROT 1                    // ganti ke 3 untuk layar terbalik
 #define AP_NAME "Weather-Setup"
 #define AUTO_ROTATE_MS 10000UL   // 0 = matikan auto ganti halaman
@@ -220,12 +222,16 @@ uint32_t fetchIntervalMs() {
 
 // ---------------- baterai ----------------
 void sampleBattery() {
+  digitalWrite(ADC_EN, HIGH);
+  delay(3);
   uint32_t sum = 0;
-  for (int i = 0; i < 16; i++) sum += analogReadMilliVolts(BAT_PIN);
-  float v = (sum / 16.0f) * 2.0f / 1000.0f;  // pembagi tegangan 2:1
-  if (vbat < 0.1f) vbat = v;
-  else vbat = vbat * 0.7f + v * 0.3f;
-  batPresent = (vbat > 2.8f && vbat < 4.6f);
+  for (int i = 0; i < 8; i++) { sum += analogReadMilliVolts(BAT_PIN); delay(1); }
+  digitalWrite(ADC_EN, LOW);
+  int mv = (int)(sum / 8) * 2;  // pembagi tegangan 2:1
+  batPresent = mv > 2800;       // di bawah itu: tanpa baterai / tidak terbaca
+  if (!batPresent) return;
+  float v = mv / 1000.0f;
+  vbat = (vbat < 0.1f) ? v : (vbat * 0.7f + v * 0.3f);
   if (vbat > 4.19f) charging = true;
   if (millis() - lastTrend > 60000UL) {  // tren tegangan tiap 1 menit
     lastTrend = millis();
@@ -357,6 +363,18 @@ int drawDegNum(int x, int y, int v, int font, uint16_t col) {
   return x + w + 7;
 }
 
+// angka suhu + derajat, dipusatkan di cx
+void drawDegNumC(int cx, int y, int v, int font, uint16_t col) {
+  char b[8];
+  snprintf(b, sizeof(b), "%d", v);
+  spr.setTextColor(col);
+  spr.setTextDatum(TL_DATUM);
+  int w = spr.textWidth(b, font);
+  int x0 = cx - (w + 5) / 2;
+  spr.drawString(b, x0, y, font);
+  spr.drawCircle(x0 + w + 3, y + ((font >= 4) ? 5 : 3), 2, col);
+}
+
 // ---------------- komponen UI ----------------
 void drawHeader(const char* title, bool showClock = true) {
   spr.setTextDatum(TL_DATUM);
@@ -447,22 +465,28 @@ void pageHome() {
   else strcpy(b, "--:--");
   spr.setTextDatum(TL_DATUM);
   spr.setTextColor(C_TXT);
-  int w = spr.drawString(b, 6, 20, 6);
+  int w = spr.drawString(b, 6, 28, 6);
   if (ok) {
     snprintf(b, sizeof(b), "%02d", ti.tm_sec);
     spr.setTextColor(C_ACC);
-    spr.drawString(b, 6 + w + 4, 46, 4);
+    spr.drawString(b, 6 + w + 4, 54, 4);
     snprintf(b, sizeof(b), "%s, %d %s", DAYFULL[ti.tm_wday % 7], ti.tm_mday, MON[ti.tm_mon % 12]);
     spr.setTextColor(C_MUT);
-    spr.drawString(b, 8, 74, 2);
+    spr.drawString(b, 8, 82, 2);
   }
 
   if (wx.valid) {
-    drawIcon(codeToIco(wx.code, wx.isDay), 202, 34, 16, true);
-    drawDegNum(178, 54, iround(wx.temp), 4, C_TXT);
-    spr.setTextDatum(TR_DATUM);
+    const int IC = 200;  // sumbu tengah kolom cuaca
+    drawIcon(codeToIco(wx.code, wx.isDay), IC, 38, 16, true);
+    drawDegNumC(IC, 56, iround(wx.temp), 4, C_TXT);
+    const char* ct = codeText(wx.code);
+    int cw = spr.textWidth(ct, 2);
+    int tx = IC;
+    if (tx - cw / 2 < 126) tx = 126 + cw / 2;
+    if (tx + cw / 2 > 236) tx = 236 - cw / 2;
+    spr.setTextDatum(TC_DATUM);
     spr.setTextColor(C_ACC);
-    spr.drawString(codeText(wx.code), 236, 88, 2);
+    spr.drawString(ct, tx, 89, 2);
     snprintf(b, sizeof(b), "%d%%", wx.hum);
     chip(6, 108, 72, 0, b, C_BLUE);
     snprintf(b, sizeof(b), "%dkm/j", iround(wx.wind));
@@ -1121,7 +1145,6 @@ void updateBacklight() {
 // ---------------- tombol & menu ----------------
 struct Btn { uint8_t pin; bool down; uint32_t t0; bool longDone; uint8_t clicks; uint32_t tRel; };
 Btn b1 = {BTN1, false, 0, false, 0, 0};
-Btn b2 = {BTN2, false, 0, false, 0, 0};
 
 // return: 0 tidak ada, 1 klik, 2 tahan, 3 klik ganda (hanya jika dbl = true)
 int pollBtn(Btn& b, uint32_t longMs, bool dbl) {
@@ -1142,23 +1165,48 @@ int pollBtn(Btn& b, uint32_t longMs, bool dbl) {
   return 0;
 }
 
-// power off: deep sleep, bangun dengan BTN2 (GPIO35)
+// ---------------- tombol atas + power off (pola Emochi) ----------------
+// Klik langsung terdeteksi saat ditekan. Klik kedua dalam 450 ms = klik ganda (power off),
+// dideteksi saat penekanan kedua. Tahan 900 ms = event "tahan". Return: 0, 1 klik, 2 tahan, 3 ganda.
+bool prevTop = true, haveTop = false, topLongDone = false;
+uint32_t lastTopPress = 0, topDownAt = 0;
+uint32_t refreshAt = 0;  // refresh data ditunda sebentar supaya klik ganda tidak terganggu fetch
+
+int pollTop() {
+  bool top = digitalRead(BTN2);
+  uint32_t now = millis();
+  int ev = 0;
+  if (!top && prevTop && now - lastTopPress >= 60) {  // tekan (buang bounce < 60 ms)
+    topDownAt = now;
+    topLongDone = false;
+    if (haveTop && now - lastTopPress < 450) { haveTop = false; ev = 3; }
+    else { haveTop = true; ev = 1; }
+    lastTopPress = now;
+  }
+  if (!top && !topLongDone && topDownAt && now - topDownAt >= 900) {
+    topLongDone = true;
+    haveTop = false;
+    ev = 2;
+  }
+  if (top) topDownAt = 0;
+  prevTop = top;
+  return ev;
+}
+
 void goSleep() {
-  msgScreen("Mati", "Tekan BTN2", "untuk menyala");
-  delay(1500);
-  while (digitalRead(BTN2) == LOW) delay(10);
+  msgScreen("Mati", "Tekan tombol atas", "untuk menyala");
+  delay(900);
+  while (digitalRead(BTN2) == LOW) delay(10);  // tunggu tombol dilepas
+  delay(80);
   ledcWrite(0, 0);
-  ledcDetachPin(TFT_BL);
+  ledcDetachPin(TFT_BL);  // lepas PWM supaya pin benar-benar bisa di-LOW-kan
   pinMode(TFT_BL, OUTPUT);
   digitalWrite(TFT_BL, LOW);
   tft.writecommand(TFT_DISPOFF);
   tft.writecommand(TFT_SLPIN);
-  server.stop();
-  WiFi.disconnect(true);
-  WiFi.mode(WIFI_OFF);
-  gpio_hold_en((gpio_num_t)TFT_BL);
-  gpio_deep_sleep_hold_en();
-  esp_sleep_enable_ext0_wakeup(GPIO_NUM_35, 0);
+  digitalWrite(ADC_EN, LOW);
+  delay(120);
+  esp_sleep_enable_ext0_wakeup(GPIO_NUM_35, 0);  // klik tombol atas = nyala
   esp_deep_sleep_start();
 }
 
@@ -1184,10 +1232,11 @@ void menuInput(int e1, int e2) {
 // ---------------- setup & loop ----------------
 void setup() {
   Serial.begin(115200);
-  gpio_hold_dis((gpio_num_t)TFT_BL);
-  gpio_deep_sleep_hold_dis();
+  pinMode(ADC_EN, OUTPUT);
+  digitalWrite(ADC_EN, LOW);  // HIGH hanya saat mengukur baterai
   pinMode(BTN1, INPUT_PULLUP);
   pinMode(BTN2, INPUT);  // GPIO35: pull-up eksternal di board
+  prevTop = digitalRead(BTN2);  // supaya klik yang membangunkan tidak terhitung
   analogSetPinAttenuation(BAT_PIN, ADC_11db);
 
   tft.init();
@@ -1206,6 +1255,7 @@ void setup() {
   ledcAttachPin(TFT_BL, 0);
   ledcWrite(0, curBri);
   setTheme(true);
+  delay(30);
   sampleBattery();
 
   msgScreen("Weather", "T-Display Station", "memulai...");
@@ -1245,15 +1295,16 @@ void loop() {
   if (apMode) dns.processNextRequest();
   if (restartAt && millis() > restartAt) ESP.restart();
 
-  int e1 = pollBtn(b1, 3000, true);
-  int e2 = pollBtn(b2, 900, false);
+  int e1 = pollBtn(b1, 3000, false);  // tombol bawah
+  int e2 = pollTop();                 // tombol atas (klik ganda = power off)
   if (e1 || e2) {
     if (screenOff) { e1 = 0; e2 = 0; }  // tombol pertama hanya membangunkan layar
     lastInput = millis();
     lastRot = millis();
   }
   if (e1 == 2 && !inMenu) resetWifi();
-  if (e1 == 3 && !inMenu) goSleep();
+  if (e2 == 3) refreshAt = 0;
+  if (e2 == 3 && !inMenu) goSleep();
 
   if (apMode) {
     // di mode setup: kalau WiFi tersimpan ternyata nyambung, restart ke mode normal
@@ -1263,13 +1314,15 @@ void loop() {
   }
 
   if (inMenu) {
-    menuInput(e1, e2);
+    menuInput(e1, e2 == 3 ? 1 : e2);  // di menu, klik cepat = dua kali ubah nilai
     if (millis() - lastInput > 30000UL) exitMenu();
   } else {
     if (e1 == 1) goPage((page + 1) % PAGES);
-    if (e2 == 1) fetchNow = true;
-    if (e2 == 2) { inMenu = true; menuSel = 0; }
+    if (e2 == 1) refreshAt = millis() + 500;  // dijalankan kalau tidak jadi klik ganda
+    if (e2 == 2) { refreshAt = 0; inMenu = true; menuSel = 0; }
   }
+
+  if (refreshAt && millis() >= refreshAt) { refreshAt = 0; fetchNow = true; }
 
   if (millis() - lastBat > 5000UL) {
     lastBat = millis();
