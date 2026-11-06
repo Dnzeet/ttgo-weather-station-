@@ -2,12 +2,12 @@
 //  Weather Station + Jam - LilyGo T-Display (ESP32, ST7789 135x240)
 //  Data: Open-Meteo (tanpa API key). 5 halaman + menu + web setup.
 //
-//  Tombol bawah (BTN1, GPIO0)  : klik = halaman berikut | klik ganda = BUKA PENGATURAN
-//                                tahan 3 dtk = reset WiFi
+//  Tombol bawah (BTN1, GPIO0)  : klik = halaman berikut | TAHAN 1 dtk = buka pengaturan
 //  Tombol atas  (BTN2, GPIO35) : klik = refresh data | klik ganda = POWER OFF
 //  Bangun dari power off: tekan sekali tombol atas.
-//  Di menu: bawah = geser pilihan, atas = ubah nilai / pilih "Kembali",
-//           tahan bawah 1 dtk = keluar (pintasan), otomatis keluar setelah 30 dtk
+//  Di menu: bawah = geser pilihan (tahan 1 dtk = keluar), atas = ubah nilai / pilih,
+//           baris "Reset WiFi" butuh dua klik (konfirmasi), "< Kembali" untuk keluar,
+//           otomatis keluar setelah 30 dtk.
 //  Pola power off & baca baterai mengikuti firmware Emochi.
 // ============================================================
 #include <Arduino.h>
@@ -33,7 +33,7 @@
 #define AP_NAME "Weather-Setup"
 #define AUTO_ROTATE_MS 10000UL   // 0 = matikan auto ganti halaman
 #define PAGES 5
-#define MENU_N 6   // 5 pengaturan + "Kembali"
+#define MENU_N 7   // 5 pengaturan + Reset WiFi + "Kembali"
 #define SW 240
 #define SH 135
 
@@ -92,7 +92,10 @@ uint32_t lastBriCalc = 0, lastFade = 0;
 
 // baterai
 float vbat = 0, vTrend = 0;
-bool batPresent = false, charging = false;
+bool batPresent = false, charging = false, lowBattery = false;
+int battPct = 0;
+bool confirmReset = false;
+uint32_t lastAdvanceAt = 0;
 uint32_t lastBat = 0, lastTrend = 0;
 
 uint16_t C_BG, C_PANEL, C_TXT, C_MUT, C_ACC, C_BLUE, C_TEAL, C_AREA, C_TRACK, C_CLOUD, C_CLOUD2;
@@ -223,6 +226,18 @@ uint32_t fetchIntervalMs() {
 }
 
 // ---------------- baterai ----------------
+// kurva LiPo (sama dengan firmware Emochi): mV -> persen
+int pctFromMv(int mv) {
+  static const int T[9][2] = {{3300, 0}, {3500, 5}, {3600, 15}, {3700, 35}, {3800, 55},
+                              {3900, 70}, {4000, 82}, {4100, 92}, {4200, 100}};
+  if (mv <= T[0][0]) return 0;
+  if (mv >= T[8][0]) return 100;
+  for (int i = 1; i < 9; i++) {
+    if (mv <= T[i][0]) return T[i - 1][1] + (T[i][1] - T[i - 1][1]) * (mv - T[i - 1][0]) / (T[i][0] - T[i - 1][0]);
+  }
+  return 100;
+}
+
 void sampleBattery() {
   digitalWrite(ADC_EN, HIGH);
   delay(3);
@@ -231,33 +246,44 @@ void sampleBattery() {
   digitalWrite(ADC_EN, LOW);
   int mv = (int)(sum / 8) * 2;  // pembagi tegangan 2:1
   batPresent = mv > 2800;       // di bawah itu: tanpa baterai / tidak terbaca
-  if (!batPresent) return;
+  if (!batPresent) { lowBattery = false; return; }
   float v = mv / 1000.0f;
   vbat = (vbat < 0.1f) ? v : (vbat * 0.7f + v * 0.3f);
+  battPct = pctFromMv((int)(vbat * 1000.0f));
+  if (!lowBattery && vbat < 3.5f) lowBattery = true;       // peringatan di bawah 3,5 V
+  else if (lowBattery && vbat > 3.6f) lowBattery = false;  // hysteresis sampai 3,6 V
+  // Tebakan sedang diisi: tegangan naik dari waktu ke waktu (beban tidak bisa menaikkan tegangan).
+  // Jendela 3 menit, ambang 10 mV agar arus isi kecil pun terdeteksi.
   if (vbat > 4.19f) charging = true;
-  if (millis() - lastTrend > 60000UL) {  // tren tegangan tiap 1 menit
+  if (millis() - lastTrend > 180000UL) {
     lastTrend = millis();
     if (vTrend > 0.1f) {
       float d = vbat - vTrend;
-      if (d > 0.012f) charging = true;
-      else if (d < -0.012f) charging = false;
+      if (d > 0.010f) charging = true;
+      else if (d < -0.010f) charging = false;
     }
     vTrend = vbat;
   }
 }
 
+// 0..4 batang dari persen, dengan hysteresis supaya tidak berkedip di batas
 int batBars() {
-  if (vbat > 4.05f) return 4;
-  if (vbat > 3.88f) return 3;
-  if (vbat > 3.72f) return 2;
-  if (vbat > 3.58f) return 1;
-  return 0;
+  static int cur = -1;
+  const int th[4] = {8, 25, 50, 75};
+  if (cur < 0) {
+    cur = 0;
+    for (int i = 0; i < 4; i++) if (battPct >= th[i]) cur = i + 1;
+    return cur;
+  }
+  while (cur < 4 && battPct >= th[cur] + 3) cur++;
+  while (cur > 0 && battPct < th[cur - 1]) cur--;
+  return cur;
 }
 
 void drawBattery(int x, int y) {
   if (!cfg.showBat || !batPresent) return;
   int bars = batBars();
-  bool low = (bars <= 1 && !charging);
+  bool low = (lowBattery && !charging);
   uint16_t col = C_TXT;
   if (low && ((frame / 10) % 2)) col = spr.color565(240, 70, 70);
   spr.drawRoundRect(x, y, 15, 9, 2, col);
@@ -467,14 +493,14 @@ void pageHome() {
   else strcpy(b, "--:--");
   spr.setTextDatum(TL_DATUM);
   spr.setTextColor(C_TXT);
-  int w = spr.drawString(b, 6, 28, 6);
+  int w = spr.drawString(b, 6, 34, 6);
   if (ok) {
     snprintf(b, sizeof(b), "%02d", ti.tm_sec);
     spr.setTextColor(C_ACC);
-    spr.drawString(b, 6 + w + 4, 54, 4);
+    spr.drawString(b, 6 + w + 4, 58, 4);
     snprintf(b, sizeof(b), "%s, %d %s", DAYFULL[ti.tm_wday % 7], ti.tm_mday, MON[ti.tm_mon % 12]);
     spr.setTextColor(C_MUT);
-    spr.drawString(b, 8, 82, 2);
+    spr.drawString(b, 8, 89, 2);
   }
 
   if (wx.valid) {
@@ -735,19 +761,19 @@ void pageAnalog() {
 void pageMenu() {
   spr.setTextDatum(TL_DATUM);
   spr.setTextColor(C_MUT);
-  spr.drawString("PENGATURAN", 6, 2, 2);
-  const char* L[MENU_N] = {"Kecerahan", "Mode hemat", "Redup malam", "Layar mati", "Ikon baterai", "< Kembali"};
+  spr.drawString("PENGATURAN", 6, 0, 2);
+  const char* L[MENU_N] = {"Kecerahan", "Mode hemat", "Redup malam", "Layar mati", "Ikon baterai", "Reset WiFi", "< Kembali"};
   for (int i = 0; i < MENU_N; i++) {
-    int y = 19 + i * 17;
+    int y = 17 + i * 15;
     if (i == menuSel) {
-      spr.fillRoundRect(4, y, 232, 16, 4, C_PANEL);
-      spr.fillRect(4, y, 3, 16, C_ACC);
+      spr.fillRoundRect(4, y, 232, 14, 4, C_PANEL);
+      spr.fillRect(4, y, 3, 14, C_ACC);
     }
     spr.setTextDatum(TL_DATUM);
     spr.setTextColor(i == MENU_N - 1 ? C_ACC : C_TXT);
-    spr.drawString(L[i], 14, y, 2);
+    spr.drawString(L[i], 14, y - 1, 2);
     if (i == 0) {
-      for (int k = 0; k < 5; k++) spr.fillRoundRect(170 + k * 13, y + 4, 11, 8, 2, k < 5 - cfg.briIdx ? C_ACC : C_TRACK);
+      for (int k = 0; k < 5; k++) spr.fillRoundRect(170 + k * 13, y + 3, 11, 8, 2, k < 5 - cfg.briIdx ? C_ACC : C_TRACK);
     } else if (i < MENU_N - 1) {
       const char* v = "";
       uint16_t col = C_TXT;
@@ -755,16 +781,20 @@ void pageMenu() {
         case 1: v = SAV_TXT[cfg.saver]; col = cfg.saver ? C_TEAL : C_MUT; break;
         case 2: v = cfg.autoDim ? "Aktif" : "Mati"; col = cfg.autoDim ? C_TEAL : C_MUT; break;
         case 3: v = SCH_TXT[cfg.sch]; col = cfg.sch ? C_TXT : C_MUT; break;
-        default: v = cfg.showBat ? "Tampil" : "Sembunyi"; col = cfg.showBat ? C_TEAL : C_MUT; break;
+        case 4: v = cfg.showBat ? "Tampil" : "Sembunyi"; col = cfg.showBat ? C_TEAL : C_MUT; break;
+        default:
+          v = (confirmReset && i == menuSel) ? "Klik lagi!" : "Hapus";
+          col = (confirmReset && i == menuSel) ? C_ACC : C_MUT;
+          break;
       }
       spr.setTextDatum(TR_DATUM);
       spr.setTextColor(col);
-      spr.drawString(v, 230, y, 2);
+      spr.drawString(v, 230, y - 1, 2);
     }
   }
   spr.setTextDatum(TC_DATUM);
   spr.setTextColor(C_MUT);
-  spr.drawString("bawah: geser   atas: ubah / pilih", 120, 124, 1);
+  spr.drawString("bawah: geser   atas: ubah / pilih", 120, 125, 1);
 }
 
 void renderPage(int p) {
@@ -1210,20 +1240,26 @@ void goSleep() {
 
 void exitMenu() {
   inMenu = false;
+  confirmReset = false;
   saveCfg();
 }
 
 // e1 = tombol bawah (1 geser, 2 tahan = keluar), e2 = tombol atas (1 ubah / pilih)
 void menuInput(int e1, int e2) {
-  if (e1 == 1) menuSel = (menuSel + 1) % MENU_N;
+  if (e1 == 1) { menuSel = (menuSel + 1) % MENU_N; confirmReset = false; }
   if (e1 == 2) { exitMenu(); return; }
   if (e2 == 1) {
+    if (menuSel != 5) confirmReset = false;
     switch (menuSel) {
       case 0: cfg.briIdx = (cfg.briIdx + 1) % 5; break;
       case 1: cfg.saver = (cfg.saver + 1) % 4; applyPower(); break;
       case 2: cfg.autoDim = !cfg.autoDim; break;
       case 3: cfg.sch = (cfg.sch + 1) % 4; break;
       case 4: cfg.showBat = !cfg.showBat; break;
+      case 5:
+        if (!confirmReset) confirmReset = true;  // klik pertama minta konfirmasi
+        else resetWifi();                        // klik kedua: hapus WiFi dan restart
+        break;
       default: exitMenu(); break;
     }
   }
@@ -1296,14 +1332,13 @@ void loop() {
   if (apMode) dns.processNextRequest();
   if (restartAt && millis() > restartAt) ESP.restart();
 
-  int e1 = pollBot(inMenu ? 1000 : 3000);  // tombol bawah
+  int e1 = pollBot(1000);  // tombol bawah (tahan 1 dtk: buka pengaturan / keluar dari menu)
   int e2 = pollTop();                 // tombol atas (klik ganda = power off)
   if (e1 || e2) {
     if (screenOff) { e1 = 0; e2 = 0; }  // tombol pertama hanya membangunkan layar
     lastInput = millis();
     lastRot = millis();
   }
-  if (e1 == 2 && !inMenu) resetWifi();
   if (e2 == 3) refreshAt = 0;
   if (e2 == 3 && !inMenu) goSleep();
 
@@ -1318,11 +1353,15 @@ void loop() {
     menuInput(e1 == 3 ? 1 : e1, e2 == 3 ? 1 : e2);  // klik cepat di menu = dua kali aksi
     if (millis() - lastInput > 30000UL) exitMenu();
   } else {
-    if (e1 == 1) goPage((page + 1) % PAGES);
-    if (e1 == 3) {  // klik ganda bawah: buka pengaturan (batalkan geser halaman dari klik pertama)
-      page = (page + PAGES - 1) % PAGES;
+    if (e1 == 1 || e1 == 3) {  // klik (atau klik cepat) = halaman berikut
+      goPage((page + 1) % PAGES);
+      lastAdvanceAt = millis();
+    }
+    if (e1 == 2) {  // tahan: buka pengaturan; batalkan geser halaman dari klik pertama
+      if (millis() - lastAdvanceAt < 1600) page = (page + PAGES - 1) % PAGES;
       inMenu = true;
       menuSel = 0;
+      confirmReset = false;
     }
     if (e2 == 1) refreshAt = millis() + 500;  // dijalankan kalau tidak jadi klik ganda
   }
