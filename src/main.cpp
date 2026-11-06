@@ -2,11 +2,12 @@
 //  Weather Station + Jam - LilyGo T-Display (ESP32, ST7789 135x240)
 //  Data: Open-Meteo (tanpa API key). 5 halaman + menu + web setup.
 //
-//  Tombol bawah (BTN1, GPIO0)  : klik = halaman berikut | tahan 3 dtk = reset WiFi
+//  Tombol bawah (BTN1, GPIO0)  : klik = halaman berikut | klik ganda = BUKA PENGATURAN
+//                                tahan 3 dtk = reset WiFi
 //  Tombol atas  (BTN2, GPIO35) : klik = refresh data | klik ganda = POWER OFF
-//                                tahan 1 dtk = menu pengaturan
 //  Bangun dari power off: tekan sekali tombol atas.
-//  Di menu: bawah = pilih item, atas = ubah nilai, tahan atas = simpan & keluar
+//  Di menu: bawah = geser pilihan, atas = ubah nilai / pilih "Kembali",
+//           tahan bawah 1 dtk = keluar (pintasan), otomatis keluar setelah 30 dtk
 //  Pola power off & baca baterai mengikuti firmware Emochi.
 // ============================================================
 #include <Arduino.h>
@@ -32,6 +33,7 @@
 #define AP_NAME "Weather-Setup"
 #define AUTO_ROTATE_MS 10000UL   // 0 = matikan auto ganti halaman
 #define PAGES 5
+#define MENU_N 6   // 5 pengaturan + "Kembali"
 #define SW 240
 #define SH 135
 
@@ -734,19 +736,19 @@ void pageMenu() {
   spr.setTextDatum(TL_DATUM);
   spr.setTextColor(C_MUT);
   spr.drawString("PENGATURAN", 6, 2, 2);
-  const char* L[5] = {"Kecerahan", "Mode hemat", "Redup malam", "Layar mati", "Ikon baterai"};
-  for (int i = 0; i < 5; i++) {
-    int y = 22 + i * 19;
+  const char* L[MENU_N] = {"Kecerahan", "Mode hemat", "Redup malam", "Layar mati", "Ikon baterai", "< Kembali"};
+  for (int i = 0; i < MENU_N; i++) {
+    int y = 19 + i * 17;
     if (i == menuSel) {
-      spr.fillRoundRect(4, y, 232, 18, 4, C_PANEL);
-      spr.fillRect(4, y, 3, 18, C_ACC);
+      spr.fillRoundRect(4, y, 232, 16, 4, C_PANEL);
+      spr.fillRect(4, y, 3, 16, C_ACC);
     }
     spr.setTextDatum(TL_DATUM);
-    spr.setTextColor(C_TXT);
-    spr.drawString(L[i], 14, y + 1, 2);
+    spr.setTextColor(i == MENU_N - 1 ? C_ACC : C_TXT);
+    spr.drawString(L[i], 14, y, 2);
     if (i == 0) {
-      for (int k = 0; k < 5; k++) spr.fillRoundRect(170 + k * 13, y + 5, 11, 8, 2, k < 5 - cfg.briIdx ? C_ACC : C_TRACK);
-    } else {
+      for (int k = 0; k < 5; k++) spr.fillRoundRect(170 + k * 13, y + 4, 11, 8, 2, k < 5 - cfg.briIdx ? C_ACC : C_TRACK);
+    } else if (i < MENU_N - 1) {
       const char* v = "";
       uint16_t col = C_TXT;
       switch (i) {
@@ -757,12 +759,12 @@ void pageMenu() {
       }
       spr.setTextDatum(TR_DATUM);
       spr.setTextColor(col);
-      spr.drawString(v, 230, y + 1, 2);
+      spr.drawString(v, 230, y, 2);
     }
   }
   spr.setTextDatum(TC_DATUM);
   spr.setTextColor(C_MUT);
-  spr.drawString("1:pilih  2:ubah  tahan 2:keluar", 120, 122, 1);
+  spr.drawString("bawah: geser   atas: ubah / pilih", 120, 124, 1);
 }
 
 void renderPage(int p) {
@@ -1143,33 +1145,37 @@ void updateBacklight() {
 }
 
 // ---------------- tombol & menu ----------------
-struct Btn { uint8_t pin; bool down; uint32_t t0; bool longDone; uint8_t clicks; uint32_t tRel; };
-Btn b1 = {BTN1, false, 0, false, 0, 0};
+// Tombol bawah, pola yang sama dengan tombol atas (klik pertama langsung beraksi).
+// Return: 0, 1 klik, 2 tahan (longMs), 3 klik ganda (penekanan kedua < 450 ms).
+bool prevBot = true, haveBot = false, botLongDone = false;
+uint32_t lastBotPress = 0, botDownAt = 0;
 
-// return: 0 tidak ada, 1 klik, 2 tahan, 3 klik ganda (hanya jika dbl = true)
-int pollBtn(Btn& b, uint32_t longMs, bool dbl) {
-  bool p = (digitalRead(b.pin) == LOW);
+int pollBot(uint32_t longMs) {
+  bool b = digitalRead(BTN1);
   uint32_t now = millis();
-  if (p && !b.down) { b.down = true; b.t0 = now; b.longDone = false; return 0; }
-  if (p && b.down && !b.longDone && now - b.t0 >= longMs) { b.longDone = true; b.clicks = 0; return 2; }
-  if (!p && b.down) {
-    b.down = false;
-    if (b.longDone || now - b.t0 <= 40) return 0;
-    if (!dbl) return 1;
-    b.clicks++;
-    b.tRel = now;
-    if (b.clicks >= 2) { b.clicks = 0; return 3; }
-    return 0;
+  int ev = 0;
+  if (!b && prevBot && now - lastBotPress >= 60) {  // tekan (buang bounce < 60 ms)
+    botDownAt = now;
+    botLongDone = false;
+    if (haveBot && now - lastBotPress < 450) { haveBot = false; ev = 3; }
+    else { haveBot = true; ev = 1; }
+    lastBotPress = now;
   }
-  if (dbl && !p && b.clicks == 1 && now - b.tRel >= 300) { b.clicks = 0; return 1; }
-  return 0;
+  if (!b && !botLongDone && botDownAt && now - botDownAt >= longMs) {
+    botLongDone = true;
+    haveBot = false;
+    ev = 2;
+  }
+  if (b) botDownAt = 0;
+  prevBot = b;
+  return ev;
 }
 
 // ---------------- tombol atas + power off (pola Emochi) ----------------
 // Klik langsung terdeteksi saat ditekan. Klik kedua dalam 450 ms = klik ganda (power off),
-// dideteksi saat penekanan kedua. Tahan 900 ms = event "tahan". Return: 0, 1 klik, 2 tahan, 3 ganda.
-bool prevTop = true, haveTop = false, topLongDone = false;
-uint32_t lastTopPress = 0, topDownAt = 0;
+// dideteksi saat penekanan kedua. Return: 0, 1 klik, 3 ganda.
+bool prevTop = true, haveTop = false;
+uint32_t lastTopPress = 0;
 uint32_t refreshAt = 0;  // refresh data ditunda sebentar supaya klik ganda tidak terganggu fetch
 
 int pollTop() {
@@ -1177,18 +1183,10 @@ int pollTop() {
   uint32_t now = millis();
   int ev = 0;
   if (!top && prevTop && now - lastTopPress >= 60) {  // tekan (buang bounce < 60 ms)
-    topDownAt = now;
-    topLongDone = false;
     if (haveTop && now - lastTopPress < 450) { haveTop = false; ev = 3; }
     else { haveTop = true; ev = 1; }
     lastTopPress = now;
   }
-  if (!top && !topLongDone && topDownAt && now - topDownAt >= 900) {
-    topLongDone = true;
-    haveTop = false;
-    ev = 2;
-  }
-  if (top) topDownAt = 0;
   prevTop = top;
   return ev;
 }
@@ -1215,18 +1213,20 @@ void exitMenu() {
   saveCfg();
 }
 
+// e1 = tombol bawah (1 geser, 2 tahan = keluar), e2 = tombol atas (1 ubah / pilih)
 void menuInput(int e1, int e2) {
-  if (e1 == 1) menuSel = (menuSel + 1) % 5;
+  if (e1 == 1) menuSel = (menuSel + 1) % MENU_N;
+  if (e1 == 2) { exitMenu(); return; }
   if (e2 == 1) {
     switch (menuSel) {
       case 0: cfg.briIdx = (cfg.briIdx + 1) % 5; break;
       case 1: cfg.saver = (cfg.saver + 1) % 4; applyPower(); break;
       case 2: cfg.autoDim = !cfg.autoDim; break;
       case 3: cfg.sch = (cfg.sch + 1) % 4; break;
-      default: cfg.showBat = !cfg.showBat; break;
+      case 4: cfg.showBat = !cfg.showBat; break;
+      default: exitMenu(); break;
     }
   }
-  if (e2 == 2) exitMenu();
 }
 
 // ---------------- setup & loop ----------------
@@ -1237,6 +1237,7 @@ void setup() {
   pinMode(BTN1, INPUT_PULLUP);
   pinMode(BTN2, INPUT);  // GPIO35: pull-up eksternal di board
   prevTop = digitalRead(BTN2);  // supaya klik yang membangunkan tidak terhitung
+  prevBot = digitalRead(BTN1);
   analogSetPinAttenuation(BAT_PIN, ADC_11db);
 
   tft.init();
@@ -1295,7 +1296,7 @@ void loop() {
   if (apMode) dns.processNextRequest();
   if (restartAt && millis() > restartAt) ESP.restart();
 
-  int e1 = pollBtn(b1, 3000, false);  // tombol bawah
+  int e1 = pollBot(inMenu ? 1000 : 3000);  // tombol bawah
   int e2 = pollTop();                 // tombol atas (klik ganda = power off)
   if (e1 || e2) {
     if (screenOff) { e1 = 0; e2 = 0; }  // tombol pertama hanya membangunkan layar
@@ -1314,12 +1315,16 @@ void loop() {
   }
 
   if (inMenu) {
-    menuInput(e1, e2 == 3 ? 1 : e2);  // di menu, klik cepat = dua kali ubah nilai
+    menuInput(e1 == 3 ? 1 : e1, e2 == 3 ? 1 : e2);  // klik cepat di menu = dua kali aksi
     if (millis() - lastInput > 30000UL) exitMenu();
   } else {
     if (e1 == 1) goPage((page + 1) % PAGES);
+    if (e1 == 3) {  // klik ganda bawah: buka pengaturan (batalkan geser halaman dari klik pertama)
+      page = (page + PAGES - 1) % PAGES;
+      inMenu = true;
+      menuSel = 0;
+    }
     if (e2 == 1) refreshAt = millis() + 500;  // dijalankan kalau tidak jadi klik ganda
-    if (e2 == 2) { refreshAt = 0; inMenu = true; menuSel = 0; }
   }
 
   if (refreshAt && millis() >= refreshAt) { refreshAt = 0; fetchNow = true; }
